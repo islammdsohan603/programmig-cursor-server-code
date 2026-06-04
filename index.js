@@ -1,15 +1,18 @@
-const express = require("express");
-const app = express();
-const cors = require("cors");
-const dotenv = require("dotenv");
-const passport = require("passport");
-const GoogleStrategy = require("passport-google-oauth20").Strategy;
-const jwt = require("jsonwebtoken");
-const session = require("express-session");
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import passport from "passport";
+import { Strategy as GoogleStrategy } from "passport-google-oauth20";
+import jwt from "jsonwebtoken";
+import session from "express-session";
+import Stripe from "stripe";
+import { MongoClient, ServerApiVersion, ObjectId } from "mongodb";
 
 dotenv.config();
 
-const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+const app = express();
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 app.use(
   cors({
@@ -235,10 +238,51 @@ app.get("/cursor/:id", async (req, res) => {
   }
 });
 
+// API to create checkout session
+
+app.post('/checkout', async (req, res) => {
+  try {
+
+    const { product } = req.body; //name,image,price
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: product.name,
+              images: [product.image],
+            },
+            unit_amount: product.price * 100, // Convert to cents
+          },
+
+          quantity: 1,
+        }
+      ],
+      mode: 'payment',
+      success_url: `${process.env.CLIENT_URL}/success`,
+      cancel_url: `${process.env.CLIENT_URL}/cancel`,
+    })
+
+
+    res.json({ url: session.url });
+
+
+
+  }
+  catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+})
+
+
+
 if (process.env.NODE_ENV !== "production") {
   app.listen(port, () => {
     console.log(`Port is running now ${port}`);
   });
 }
 
-module.exports = app;
+export default app;
