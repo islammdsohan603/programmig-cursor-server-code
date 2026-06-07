@@ -12,34 +12,61 @@ dotenv.config();
 
 const app = express();
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+// ✅ Stripe initialize
 
+// ✅ CORS setup
 app.use(
   cors({
     origin: [process.env.CLIENT_URL, "http://localhost:3000"],
     credentials: true,
-  }),
+  })
 );
+
 app.use(express.json());
 
+// ✅ Session setup
 app.use(
   session({
     secret: process.env.BETTER_AUTH_SECRET,
     resave: false,
-    saveUninitialized: true,
-  }),
+    saveUninitialized: false, // false করা ভালো practice
+  })
 );
+
 app.use(passport.initialize());
 app.use(passport.session());
 
-const port = process.env.PORT;
+const port = process.env.PORT || 5000;
+
+// ==================== MongoDB ====================
 
 const uri = process.env.MONGO_URI;
 const dbName = "wanderlust";
 const coursesCollectionName = "cursor";
+const usersCollectionName = "users"; // ✅ আলাদা users collection
 
 let client;
 let clientPromise;
+let stripeClient;
+
+const createApiError = (message, error, extra = {}) => ({
+  success: false,
+  message,
+  error: error?.message || String(error),
+  ...extra,
+});
+
+const getStripeClient = () => {
+  if (!process.env.STRIPE_SECRET_KEY) {
+    throw new Error("STRIPE_SECRET_KEY is not configured");
+  }
+
+  if (!stripeClient) {
+    stripeClient = new Stripe(process.env.STRIPE_SECRET_KEY);
+  }
+
+  return stripeClient;
+};
 
 const connectClient = async () => {
   if (!uri) {
@@ -71,10 +98,19 @@ const getDb = async () => {
   return connectedClient.db(dbName);
 };
 
+// ✅ Courses collection
 const getCoursesCollection = async () => {
   const db = await getDb();
   return db.collection(coursesCollectionName);
 };
+
+// ✅ Users collection (আলাদা)
+const getUsersCollection = async () => {
+  const db = await getDb();
+  return db.collection(usersCollectionName);
+};
+
+// ==================== Google Auth ====================
 
 const googleAuthReady =
   process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET;
@@ -89,7 +125,8 @@ if (googleAuthReady) {
       },
       async (accessToken, refreshToken, profile, done) => {
         try {
-          const usersCollection = await getCoursesCollection();
+          // ✅ users collection ব্যবহার করা হচ্ছে
+          const usersCollection = await getUsersCollection();
 
           const user = {
             googleId: profile.id,
@@ -99,28 +136,31 @@ if (googleAuthReady) {
             lastLogin: new Date(),
           };
 
+          // ✅ result.value এর বদলে সরাসরি result
           const result = await usersCollection.findOneAndUpdate(
             { googleId: profile.id },
             { $set: user },
-            { upsert: true, returnDocument: "after" },
+            { upsert: true, returnDocument: "after" }
           );
 
-          return done(null, result.value);
+          return done(null, result);
         } catch (error) {
           return done(error, null);
         }
-      },
-    ),
+      }
+    )
   );
 }
 
+// ✅ serializeUser - users collection থেকে
 passport.serializeUser((user, done) => {
   done(null, user._id);
 });
 
+// ✅ deserializeUser - users collection থেকে
 passport.deserializeUser(async (id, done) => {
   try {
-    const usersCollection = await getCoursesCollection();
+    const usersCollection = await getUsersCollection();
     const user = await usersCollection.findOne({ _id: new ObjectId(id) });
     done(null, user);
   } catch (error) {
@@ -128,12 +168,14 @@ passport.deserializeUser(async (id, done) => {
   }
 });
 
+// ==================== Auth Routes ====================
+
 if (googleAuthReady) {
   app.get(
     "/auth/google",
     passport.authenticate("google", {
       scope: ["profile", "email"],
-    }),
+    })
   );
 
   app.get(
@@ -149,17 +191,17 @@ if (googleAuthReady) {
           name: req.user.name,
         },
         process.env.BETTER_AUTH_SECRET,
-        { expiresIn: "7d" },
+        { expiresIn: "7d" }
       );
 
       res.redirect(
-        `${process.env.CLIENT_URL || "http://localhost:3000"}/dashboard?token=${token}`,
+        `${process.env.CLIENT_URL || "http://localhost:3000"}/dashboard?token=${token}`
       );
-    },
+    }
   );
 } else {
   app.get("/auth/google", (req, res) => {
-    res.status(500).send("Google login is not configured");
+    res.status(500).json({ error: "Google login is not configured" });
   });
 }
 
@@ -179,8 +221,10 @@ app.get("/auth/me", (req, res) => {
   res.json(req.user);
 });
 
+// ==================== General Routes ====================
+
 app.get("/", (req, res) => {
-  res.send({
+  res.json({
     success: true,
     message: "Server is running",
   });
@@ -191,31 +235,35 @@ app.get("/health/db", async (req, res) => {
     const db = await getDb();
     await db.command({ ping: 1 });
 
-    res.send({
+    res.json({
       success: true,
       message: "MongoDB connection is healthy",
       database: dbName,
       collection: coursesCollectionName,
     });
   } catch (error) {
-    res.status(500).send({
-      success: false,
-      message: "MongoDB connection failed",
+    res.status(500).json({
+      ...createApiError("MongoDB connection failed", error),
       database: dbName,
       collection: coursesCollectionName,
-      error: error.message,
     });
   }
 });
+
+// ==================== Course Routes ====================
 
 app.get("/cursor", async (req, res) => {
   try {
     const cursorData = await getCoursesCollection();
     const result = await cursorData.find().toArray();
-
-    res.send(result);
+    res.json(result);
   } catch (error) {
-    res.status(500).send({ error: error.message });
+    res.status(500).json(
+      createApiError("Course data could not be loaded", error, {
+        database: dbName,
+        collection: coursesCollectionName,
+      })
+    );
   }
 });
 
@@ -224,64 +272,88 @@ app.get("/cursor/:id", async (req, res) => {
     const id = req.params.id;
 
     if (!ObjectId.isValid(id)) {
-      return res.status(400).send({ error: "Invalid course id" });
+      return res.status(400).json({ error: "Invalid course id" });
     }
 
     const cursorData = await getCoursesCollection();
-    const query = { _id: new ObjectId(id) };
+    const result = await cursorData.findOne({ _id: new ObjectId(id) });
 
-    const result = await cursorData.findOne(query);
+    if (!result) {
+      return res.status(404).json({ error: "Course not found" });
+    }
 
-    res.send(result);
+    res.json(result);
   } catch (error) {
-    res.status(500).send({ error: error.message });
+    res.status(500).json(
+      createApiError("Course details could not be loaded", error, {
+        database: dbName,
+        collection: coursesCollectionName,
+      })
+    );
   }
 });
 
-// API to create checkout session
+// ==================== Stripe Checkout ====================
 
-app.post('/checkout', async (req, res) => {
+app.post("/checkout", async (req, res) => {
   try {
+    const { product } = req.body;
 
-    const { product } = req.body; //name,image,price
+    // ✅ Validation
+    if (!product?.name || !product?.price) {
+      return res
+        .status(400)
+        .json({ error: "Product name এবং price দরকার" });
+    }
 
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
+    if (product.price <= 0) {
+      return res
+        .status(400)
+        .json({ error: "Price অবশ্যই 0 এর বেশি হতে হবে" });
+    }
+
+    // ✅ শুধু https image Stripe accept করে, localhost না
+    const validImage =
+      product.image &&
+        product.image.startsWith("https") &&
+        !product.image.includes("localhost")
+        ? [product.image]
+        : [];
+
+    // ✅ variable নাম stripeSession করা হয়েছে (session এর সাথে conflict এড়াতে)
+    const stripe = getStripeClient();
+    const stripeSession = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
       line_items: [
         {
           price_data: {
-            currency: 'usd',
+            currency: "usd",
             product_data: {
               name: product.name,
-              images: [product.image],
+              images: validImage,
             },
-            unit_amount: product.price * 100, // Convert to cents
+            unit_amount: Math.round(product.price * 100), // ✅ Math.round দিয়ে নিরাপদ
           },
-
           quantity: 1,
-        }
+        },
       ],
-      mode: 'payment',
+      mode: "payment",
       success_url: `${process.env.CLIENT_URL}/success`,
       cancel_url: `${process.env.CLIENT_URL}/cancel`,
-    })
+    });
 
-
-    res.json({ url: session.url });
-
-
-
+    res.json({ url: stripeSession.url });
+  } catch (error) {
+    console.error("Stripe error:", error);
+    res.status(500).json(createApiError("Checkout could not be started", error));
   }
-  catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-})
+});
 
-
+// ==================== Server Start ====================
 
 if (process.env.NODE_ENV !== "production") {
   app.listen(port, () => {
-    console.log(`Port is running now ${port}`);
+    console.log(`Server is running on port ${port}`);
   });
 }
 
